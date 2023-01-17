@@ -29,16 +29,32 @@ ols_fit <- function(X, y) {
   b <- solve(XtX) %*% Xty
 }
 
+# Logit helpers ----
+# Sigmoid function
+sigmoid <- function(z) {
+  (exp(z))/(1 + exp(z))
+}
+
+# Logit log likelihood 
+# beta is the k x 1 parameter vector 
+# X is assumed to be N x k
+logit.lik <- function(beta, y, X) {
+  sig_Xb <- sigmoid(X %*% beta)
+  ll_vec <- y * log(sig_Xb) + (1 - y) * log(1 - sig_Xb)
+  nll <- -sum(ll_vec) # because stats::optim() performs minimization
+}
+
 # Matching helpers ---- 
 # Calculates inverse variance weighting matrix for input matrix X
 v_calc <- function(X) {
-  n_vec <- apply(X, 2, function(x) {sum(!is.na(x))}) # nonmissing obs.
-  colmeans <- colMeans(X, na.rm = TRUE)
-  # R recycles, and doesn't broadcast like Python
-  colmeans <- rep(colmeans, rep(nrow(X), ncol(X))) 
-  X_out <- colSums((X - colmeans)^2)/(n_vec - 1) # k x 1 for each covariate
+  # Handle the case where X is only one column 
+  if (dim(X)[2] == 1) {
+    V <- 1/diag(var(X))
+  } else {
+    V <- diag(1/diag(var(X))) 
+  }
   
-  V <- diag(1/X_out)
+  return(V)
 }
 
 # Calculates the distance based on a supplied matrix V 
@@ -49,6 +65,7 @@ distance_calc <- function(x, z, V) {
   dist <- (t(x-z) %*% V %*% (x-z))^(1/2)
   dist <- dist[1, 1]
 }
+
 
 # Inference ---- 
 # Clustered SEs
@@ -92,6 +109,8 @@ se_boot <- function(fun_results, seed = 12345, B = 50) {
   n <- fun_results[["n_obs"]]
   
   # Bootstrap the estimates 
+  set.seed(seed)
+  
   estims_bstrap <- 1:B %>% purrr::map(function(x) {
     df_boot <- dplyr::slice_sample(df, n = n, replace = FALSE)
     call_new <- call
@@ -147,7 +166,6 @@ ols_run <- function(df, y, covars, constant = TRUE) {
     k = k,
     tag_obs = tag_obs,
     var_names = covars,
-    intercept = constant,
     fitted_values = fitted_values,
     residuals = residuals,
     r_sq = r_sq,
@@ -156,9 +174,13 @@ ols_run <- function(df, y, covars, constant = TRUE) {
 }
 
 # NN Matching for the ATT
-find_treated_nn <- function(df, y, k, covars, treat_var) {
+find_treated_nn <- function(df, y, k, covars, treat_var, 
+                            estimand = "att") {
+  
   # Setup: grab matrix of covariates, both in its entirety and separated by 
   # treated/untreated, and treated/untreated outcomes 
+  estim <- NULL 
+  
   df <- df %>% dplyr::select(!!sym(y), !!sym(treat_var), all_of(covars))
   tag_obs <- which(rowSums(is.na(df))==0) # tag nonmissing obs.
   df <- na.omit(df)
@@ -185,41 +207,157 @@ find_treated_nn <- function(df, y, k, covars, treat_var) {
   x0 <- df_cntrl %>% dplyr::select(all_of(covars)) 
   
   # Calculation begins 
-  # First, find the inverse variance weighting matrix. Then, calculate 
-  # the distance matrix as an N1 x N0 matrix of matches 
+  # First, find the inverse variance weighting matrix. Then, if the 
+  # estimand is the ATT, calculate the distance matrix as an N1 x N0 matrix of 
+  # matches. 
   V <- v_calc(as.matrix(df_covars))
   
-  distances <- x0 %>%
-    apply(., 1, function(x) {
-      apply(x1, 1, function(y) distance_calc(y, x, V))
-    })
+  if (estimand == "att" | estimand == "ate") {
+    # Match treated obs. to untreated obs.
+    distances <- x0 %>%
+      apply(., 1, function(x) {
+        apply(x1, 1, function(y) distance_calc(y, x, V))
+      })
+    
+    # Find the top k values in each row of the distance matrix 
+    top_k <- list() 
+    
+    for (row in 1:nrow(distances)) {
+      top_k[[row]] <- sort(unique(distances[row, ]))
+    }
+    
+    top_k <- top_k %>% 
+      map(function(x) x[1:k])
+    
+    top_k_indx <- 1:nrow(distances) %>% 
+      purrr::map(., ~ which(distances[.x, ] %in% top_k[[.x]]))
+    
+    # Now, compute averages of the untreated outcomes based on the indices
+    y0_use <- top_k_indx %>% 
+      map(., ~ y0[.x]) %>% 
+      map_dbl(., ~ mean(.x))
+    
+    print(y0_use)
+    
+  } 
   
-  # Find the top k values in each row of the distance matrix 
-  top_k <- list() 
-  
-  for (row in 1:nrow(distances)) {
-    top_k[[row]] <- sort(unique(distances[row, ]))
+  if (estimand == "atu" | estimand == "ate") {
+    # Match untreated obs. to treated obs.
+    distances <- x1 %>%
+      apply(., 1, function(x) {
+        apply(x0, 1, function(y) distance_calc(y, x, V))
+      })
+    
+    # Find the top k values in each row of the distance matrix 
+    top_k <- list() 
+    
+    for (row in 1:nrow(distances)) {
+      top_k[[row]] <- sort(unique(distances[row, ]))
+    }
+    
+    top_k <- top_k %>% 
+      map(function(x) x[1:k])
+    
+    top_k_indx <- 1:nrow(distances) %>% 
+      purrr::map(., ~ which(distances[.x, ] %in% top_k[[.x]]))
+    
+    # Now, compute averages of the treated outcomes based on the indices
+    y1_use <- top_k_indx %>% 
+      map(., ~ y1[.x]) %>% 
+      map_dbl(., ~ mean(.x))
   }
   
-  top_k <- top_k %>% 
-    map(function(x) x[1:k])
+  # Calculate treatment effects 
+  # For the ATT, only impute y0. For the ATU, only impute y1. For the ATE,
+  # combine imputations. 
+  if (estimand == "att") {
+    estim <- mean(y1 - y0_use)
+  } else if (estimand == "atu") {
+    estim <- mean(y0 - y1_use)
+  } else if (estimand == "ate") {
+    y1_use <- c(y1, y1_use)
+    y0_use <- c(y0, y0_use)
+    
+    estim <- mean(y1_use - y0_use)
+  }
   
-  top_k_indx <- 1:nrow(distances) %>% 
-    purrr::map(., ~ which(distances[.x, ] %in% top_k[[.x]]))
-  
-  # Now, compute averages of the untreated outcomes based on the indices
-  y0_use <- top_k_indx %>% 
-    map(., ~ y0[.x]) %>% 
-    map_dbl(., ~ mean(.x))
-  
-  # Calculate final estimate of the ATT, no. of obs, and output 
-  att <- mean(y1 - y0_use)
   n <- length(y0) + length(y1)
   
-  att_out <- list(
-    estimates = att,
+  nn_out <- list(
+    estimates = estim,
     call = match.call(),
     n_obs = n,
     tag_obs = tag_obs
   )
+}
+
+# Logit routine
+logit_run <- function(df, y, covars, constant = TRUE) {
+  
+  # Select nonempty rows and prep 
+  df <- df[, c(covars, y)]
+  tag_obs <- which(rowSums(is.na(df))==0) # tag nonmissing obs.
+  df <- na.omit(df)
+  n <- nrow(df)
+  k <- length(covars) + constant
+  X <- matrixPrep(df, covars, constant = constant)
+  y <- matrixPrep(df, y)
+  
+  
+  # Fit the model 
+  b0 <- rep(0, times = k) # initialize starting values as zero 
+  b <- optim(b0, logit.lik, y = y, X = X, method = "BFGS")[["par"]]
+  
+  # Get the fitted values: Xb
+  fitted_values <- sigmoid(X %*% b)
+  
+  # Get the residuals: y - Xb 
+  residuals <- y - fitted_values
+  
+  # Final output
+  logit_out <- list(
+    call = match.call(),
+    estimates = b,
+    constant = constant,
+    n_obs = n,
+    k = k,
+    tag_obs = tag_obs,
+    var_names = covars,
+    fitted_values = fitted_values,
+    residuals = residuals
+  )
+}
+
+# Takes in a df and a logit model, the result of logit_run(), 
+# and returns the same df but with the fitted values (propensity scores)
+# and the fitted values split into nbins number of bins
+get_df_blocked <- function(df, y, treat_var, logit_mod, nbins) {
+  # Pull out useful values
+  tag_obs <- logit_mod[["tag_obs"]]
+  covars <- logit_mod[["var_names"]]
+  yhat <- logit_mod[["fitted_values"]]
+  
+  df <- df[tag_obs, ][, c(y, treat_var, covars)]
+  block <- cut(yhat, 
+               breaks = nbins, 
+               labels = FALSE)
+  
+  df_out <- cbind(df, yhat, block) %>% 
+    dplyr::rename(px = yhat)
+}
+
+plot_df_blocked <- function(df, y, treat_var) {
+  ggplot2::ggplot(df) +
+    ggplot2::geom_density(
+      aes(
+        x = !!sym(y),
+        fill = as.factor(!!sym(treat_var)),
+        color = as.factor(!!sym(treat_var))
+      ),
+      position = "identity",
+      alpha = 0.5
+    ) + 
+    labs(x = y, y = "Density", fill = treat_var) + 
+    ggplot2::facet_wrap(vars(block)) + 
+    ggplot2::guides(color = "none")
 }
