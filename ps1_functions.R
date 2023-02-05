@@ -1,5 +1,6 @@
-# Auxiliary functions ----------------------------------------------------------
-# Auxiliary ----
+################################################################################
+# AUXILIARY FUNCTIONS 
+################################################################################
 matrixPrep <- function(df, cols, constant = FALSE) {
   df_out <- df %>% select(all_of(cols))
   
@@ -10,23 +11,24 @@ matrixPrep <- function(df, cols, constant = FALSE) {
   if (constant) {
     mat_out <- addConstant(mat_out)
   }
-  
+
   mat_out
 }
 
 addConstant <- function(mat) {
-  ones <- matrix(rep(1, nrow(mat)), nrow = nrow(mat))
-  mat <- cbind(ones, mat)
+  mat <- cbind(matrix(rep(1, nrow(mat)), nrow = nrow(mat)), mat)
 }
 
-# Computational functions ------------------------------------------------------
+################################################################################
+# COMPUTATIONAL FUNCTIONS 
+################################################################################
 # Estimation ----
 # Least squares 
 ols_fit <- function(X, y) {
   Xt <- t(X)
   XtX <- Xt %*% X
   Xty <- Xt %*% y
-  b <- solve(XtX) %*% Xty
+  b <- solve(XtX, Xty, tol = 1e-19)
 }
 
 # Logit helpers ----
@@ -69,37 +71,43 @@ distance_calc <- function(x, z, V) {
 
 # Inference ---- 
 # Clustered SEs
-se_clust <- function(df, ols_fit, clust_var) {
+se_clust <- function(df, ols_fit, clust_var, fe_list = NULL) {
+  print(paste0("length of fe_list: ", length(fe_list)))
   # Grab useful values 
   df <- df[ols_fit$tag_obs, ] # grab obs. used in estimation
   clust_var_values <- unique(df[, clust_var])
   m <- length(clust_var_values) # number of clusters 
   n <- ols_fit$n_obs
   k <- ols_fit$k
+  meat <- matrix(0, nrow = k, ncol = k)
+  j <- 1
   
-  meat_list <- lapply(clust_var_values, function(i) {
+  for (i in clust_var_values) {
     indices <- which(df[, clust_var] == i)
-    
-    # Select the X matrix and residuals 
-    Xi <- matrixPrep(df[indices, ], cols = ols_fit$var_names,
-                     constant = ols_fit$constant)
-    
+    Xi <- matrix(ols_fit[["design_mat"]][indices, ], nrow = length(indices))
     eta_i <- as.matrix(ols_fit$residuals[indices], ncol = 1)
-    
-    # Calculate the meat for each cluster
     XiTXi <- t(Xi) %*% eta_i %*% t(eta_i) %*% Xi
-  })
-  
-  meat <- Reduce("+", meat_list)
+    
+    meat <- meat + XiTXi
+    j <- j + 1
+  }
+
   X <- ols_fit$design_mat 
   bread <- solve(t(X) %*% X)
+
+  # Final result: only output the SE, making Stata finite sample correction
+  # In the finite sample correction, add back any nested fixed effects to 
+  # prevent them from being subtracted off. 
+  k_eff <- k
+  if (!is.null(fe_list)) {
+    k_eff <- k - length(fe_list) - ols_fit$constant - 1
+  }
   
-  # Final result: only output the SE, making Stata finite sample correction 
-  vcov <- (m/(m-1)) * ((n-1)/(n-k)) * (bread %*% meat %*% bread)
+  vcov <- (m/(m-1)) * ((n-1)/(n-k_eff)) * (bread %*% meat %*% bread)
   se_out <- sqrt(diag(vcov))
 }
 
-# Bootstrap 
+# Bootstrap ----
 se_boot <- function(fun_results, seed = 12345, B = 50, var_by) {
   # Extract the call, data used, and number of obs. from the model object
   call <- fun_results[["call"]]
@@ -134,7 +142,6 @@ se_boot <- function(fun_results, seed = 12345, B = 50, var_by) {
   estims_bstrap <- 1:B %>% purrr::map(function(x) {
     # Sample rows 
     idx_sample <- sample(idx, size = n, replace = TRUE, prob = obs_probs)
-    # df_boot <- dplyr::slice_sample(df, n = n, replace = TRUE)
     df_boot <- df[idx_sample, ]
     call_new <- call
     call_new$df <- df_boot
@@ -148,20 +155,89 @@ se_boot <- function(fun_results, seed = 12345, B = 50, var_by) {
   se_bstrap <- sqrt(diag(var(estims_bstrap)))
 }
 
-# Routines ---------------------------------------------------------------------
+se_boot_block <- function(fun_results, seed = 12345, B = 50, block) {
+  # Extract the call, data used, and number of obs. from the model object
+  call <- fun_results[["call"]]
+  tag_obs <- fun_results[["tag_obs"]]
+  df <- rlang::eval_tidy(call[["df"]])[tag_obs, ]
+  
+  # Count block sizes 
+  levels <- df %>% 
+    dplyr::select(!!sym(block)) %>% 
+    dplyr::distinct() %>% 
+    dplyr::pull() 
+  
+  var_values <- df %>% 
+    dplyr::select(!!sym(block)) %>% 
+    dplyr::pull() 
+  
+  obs_labels <- match(var_values, levels)
+  
+  probs <- levels %>% 
+    purrr::map_dbl(~ sum(var_values == .x))
+  
+  probs <- probs/length(var_values)
+  
+  df <- df %>% 
+    cbind(obs_labels)
+  
+  print(paste0("Number of blocks: ", length(levels)))
+  idx <- 1:length(levels) # indices: number of blocks 
+  
+  # Bootstrap the estimates 
+  set.seed(seed)
+  
+  estims_bstrap <- 1:B %>% purrr::map(function(x) {
+    # Sample blocks 
+    idx_sample <- sample(idx, size = length(levels), replace = TRUE, 
+                         prob = probs)
+    df_boot <- df[df$obs_labels %in% idx_sample, ]
+    call_new <- call
+    call_new$df <- df_boot
+    fn_name <- rlang::as_string(call[[1]]) # function name 
+    estim <- do.call(fn_name, as.list(call_new)[-1])$estimates
+  })
+  
+  estims_bstrap <- estims_bstrap %>% 
+    purrr::reduce(rbind)
+  
+  se_bstrap <- sqrt(diag(var(estims_bstrap, na.rm = TRUE)))
+}
+
+################################################################################
+# ROUTINES 
+################################################################################
 # Function arguments are consistently coded to play nice with other functions 
 # eg bootstrapping 
-ols_run <- function(df, y, covars, constant = TRUE) {
+ols_run <- function(df, y, covars, constant = TRUE, wt = NULL) {
   
   # Select nonempty rows and prep 
-  df <- df[, c(covars, y)]
+  if (!is.null(wt)) {
+    df <- df[, c(covars, y, wt)]
+  } else {
+    df <- df[, c(covars, y)]
+  }
+
   tag_obs <- which(rowSums(is.na(df))==0) # tag nonmissing obs.
   df <- na.omit(df)
+  
+  if (!is.null(wt)) {
+    wt <- matrixPrep(df, cols = wt) %>% as.vector()
+  } 
+  
+  df <- df[, c(covars, y)]
   n <- nrow(df)
   k <- length(covars) + constant
-  X <- matrixPrep(df, covars, constant = constant)
-  y <- matrixPrep(df, y)
+  X_unweight <- matrixPrep(df, covars, constant = constant)
+  y_unweight <- matrixPrep(df, y) 
   
+  X <- X_unweight
+  y <- y_unweight
+  
+  if (!is.null(wt)) {
+    X <- X_unweight * sqrt(wt)
+    y <- y_unweight * sqrt(wt)
+  } 
   
   # Fit the model 
   b <- ols_fit(X, y)
@@ -169,9 +245,11 @@ ols_run <- function(df, y, covars, constant = TRUE) {
   
   # Get the fitted values: Xb
   fitted_values <- X %*% b
+  fitted_values_unweight <- X_unweight %*% b
   
   # Get the residuals: y - Xb 
   residuals <- y - fitted_values
+  residuals_unweight <- y_unweight - fitted_values_unweight
   
   # R-squared and adjusted R-squared
   sst <- sum((y - mean(y))^2)
@@ -182,6 +260,8 @@ ols_run <- function(df, y, covars, constant = TRUE) {
   # Final output
   ols_out <- list(
     design_mat = X,
+    X_unweight = X_unweight,
+    y_unweight = y_unweight,
     call = match.call(),
     estimates = coefs,
     constant = constant,
@@ -191,6 +271,7 @@ ols_run <- function(df, y, covars, constant = TRUE) {
     var_names = covars,
     fitted_values = fitted_values,
     residuals = residuals,
+    residuals_unweight = residuals_unweight,
     r_sq = r_sq,
     r_sq_adjust = r_sq_adjust
   )
@@ -383,20 +464,77 @@ plot_df_blocked <- function(df, y, treat_var) {
     ggplot2::guides(color = "none")
 }
 
-# DID Monte Carlo helper functions ----
+# cs_did routine 
+cs_did_run <- function(df, rel_time, covars = NULL) {
+  if (!is.null(covars)) {
+    df <- df[, c(covars, "y", "cohort", "rel_time", "year", "d")]
+    df <- na.omit(df)
+    n <- nrow(df)
+    tag_obs <- which(rowSums(is.na(df))==0) # tag nonmissing obs.
+  } else {
+    df <- df[, c("y", "cohort", "rel_time", "year", "d")]
+    df <- na.omit(df)
+    n <- nrow(df)
+    tag_obs <- which(rowSums(is.na(df))==0) # tag nonmissing obs.
+  } 
+  
+  cs_did_results <- cs_did(df, rel_time, covars)
+  
+  # Final output
+  cs_did_out <- list(
+    call = match.call(),
+    estimates = cs_did_results,
+    n_obs = n,
+    tag_obs = tag_obs
+  )
+}
+
+# DID imputation routine 
+impute_did_run <- function(df, r, rel_times_exclude = -1, covars = NULL) {
+  if (!is.null(covars)) {
+    df <- df %>% 
+      dplyr::select(y, d, starts_with("cohort_"), starts_with("year_"),
+             starts_with("rel_time_"), cohort, year, all_of(covars))
+   df <- na.omit(df)
+   n <- nrow(df)
+   tag_obs <- which(rowSums(is.na(df))==0) # tag nonmissing obs.
+  } else {
+    df <- df %>% 
+      dplyr::select(y, d, starts_with("cohort_"), starts_with("year_"),
+             starts_with("rel_time_"), cohort, year)
+    df <- na.omit(df)
+    n <- nrow(df)
+    tag_obs <- which(rowSums(is.na(df))==0) # tag nonmissing obs.
+  }
+
+  impute_did_results <- impute_did(df, r, covars = covars)
+  
+  # Final output
+  impute_did_out <- list(
+    call = match.call(),
+    estimates = impute_did_results,
+    n_obs = n,
+    tag_obs = tag_obs
+  )
+}
+
+################################################################################
+# DID MONTE CARLO FUNCTIONS 
+################################################################################
 # Helper functions ----
-# Function to calculate the weights for a given cohort in a given year
+# Function to calculate all the weights on the static TWFE estimator, based on 
+# the residualized treatment indicator.
 weight_calc <- function(df_resid, ref_cohort) {
   props <- df_resid %>% 
-    group_by(cohort) %>% 
-    summarise(
+    dplyr::group_by(cohort) %>% 
+    dplyr::summarise(
       prop = n()/nrow(df_resid),
       .groups = "keep"
     )
   
   df_sum <- df_resid %>% 
-    group_by(cohort, year) %>% 
-    summarise(
+    dplyr::group_by(cohort, year) %>% 
+    dplyr::summarise(
       mean_resid = mean(resid),
       .groups = "keep"
     ) 
@@ -414,10 +552,10 @@ weight_calc <- function(df_resid, ref_cohort) {
 # different relative times r 
 get_wts_e_r <- function(df_did, e, r, g, rel_times_exclude) {
   df_reg <- df_did %>% 
-    select(cohort, starts_with("rel_time"), starts_with("unit_"),
+    dplyr::select(cohort, starts_with("rel_time"), starts_with("unit_"),
            starts_with("year_")) %>% 
-    mutate(tag_obs = if_else(cohort == e & rel_time == r, 1, 0)) %>% 
-    mutate(tag_obs = replace_na(tag_obs, 0))
+    dplyr::mutate(tag_obs = if_else(cohort == e & rel_time == r, 1, 0)) %>% 
+    dplyr::mutate(tag_obs = replace_na(tag_obs, 0))
   
   # Exclude unit, year, and relative time dummies
   unit_vars <- grep("unit_", names(df_reg), value = TRUE)[-1]
@@ -446,8 +584,8 @@ get_wts_e_r <- function(df_did, e, r, g, rel_times_exclude) {
 # g = the coefficient to estimate 
 get_wts_dynamic <- function(df_did, g, rel_times_exclude) {
   cohorts_times <- df_did %>% 
-    distinct(cohort, rel_time) %>% 
-    arrange(cohort, rel_time)
+    dplyr::distinct(cohort, rel_time) %>% 
+    dplyr::arrange(cohort, rel_time)
   
   wts <- map2(
     cohorts_times$cohort,
@@ -455,7 +593,7 @@ get_wts_dynamic <- function(df_did, g, rel_times_exclude) {
     ~ as.data.frame(get_wts_e_r(df_did, e = .x, r = .y, g = g,
                                 rel_times_exclude = rel_times_exclude))
   ) %>% 
-    list_rbind() %>% 
+    purrr::list_rbind() %>% 
     cbind(cohorts_times$cohort) %>% 
     cbind(cohorts_times$rel_time)
   
@@ -468,9 +606,9 @@ get_wts_dynamic <- function(df_did, g, rel_times_exclude) {
 # dynamic specification
 coef_calculate <- function(df_wts) {
   df_wts <- df_wts %>% 
-    mutate(att_contrib = att * wt) %>% 
-    mutate(att_homog_contrib = att_homog * wt) %>% 
-    summarise(b_att = sum(att_contrib, na.rm = TRUE),
+    dplyr::mutate(att_contrib = att * wt) %>% 
+    dplyr::mutate(att_homog_contrib = att_homog * wt) %>% 
+    dplyr::summarise(b_att = sum(att_contrib, na.rm = TRUE),
               b_att_homog = sum(att_homog_contrib, na.rm = TRUE),
               .groups = "keep")
   
@@ -490,7 +628,7 @@ plot_wt_rel_time <- function(df_wts, r) {
 
 coefs_plot <- function(df_coefs, g, M) {
   df_plot <- df_coefs %>% 
-    mutate(var = if_else(var == "b_att_mean", "Heterogeneous ATT's", 
+    dplyr::mutate(var = if_else(var == "b_att_mean", "Heterogeneous ATT's", 
                          "Homogeneous ATT's"))
   ggplot(df_plot, aes(x = var, y = estim)) + 
     geom_point(color = "dodgerblue") + 
@@ -505,91 +643,96 @@ coefs_plot <- function(df_coefs, g, M) {
 
 dynamic_wts_df_process <- function(df, trt_df, trt_df_homog) {
   df_out <- df %>% 
-    group_by(cohort, rel_time) %>% 
-    summarise(wt = mean(wt), .groups = "keep") 
+    dplyr::group_by(cohort, rel_time) %>% 
+    dplyr::summarise(wt = mean(wt), .groups = "keep") 
   
   df_out <- df_out %>% 
     left_join(trt_df, by = c("cohort", "rel_time")) %>% 
-    select(-year) %>% 
+    dplyr::select(-year) %>% 
     left_join(trt_df_homog, by = c("cohort", "rel_time")) %>% 
-    select(-year)
+    dplyr::select(-year)
 }
 
 dynamic_coef_df_process <- function(df, M) {
   df_out <- df %>% 
-    summarise(b_att_mean = mean(b_att),
+    dplyr::summarise(b_att_mean = mean(b_att),
               b_att_sd = sd(b_att),
               b_att_homog_mean = mean(b_att_homog),
               b_att_homog_sd = sd(b_att_homog),
               .groups = "keep") %>% 
     pivot_longer(cols = contains("_mean"), names_to = "var",
                  values_to = "estim") %>% 
-    mutate(sd = if_else(var == "b_att_mean", b_att_sd, b_att_homog_sd)) %>% 
-    select(-contains("_sd"))
+    dplyr::mutate(sd = if_else(var == "b_att_mean", b_att_sd, b_att_homog_sd)) %>% 
+    dplyr::select(-contains("_sd"))
   
   # Confidence intervals
   df_out <- df_out %>% 
-    mutate(ci_95up = estim + qt(.975, M-1)*sd,
+    dplyr::mutate(ci_95up = estim + qt(.975, M-1)*sd,
            ci_95lo = estim - qt(.975, M-1)*sd)
 }
 
 # Cohort-weighted ATT 
 weighted_att_calc <- function(df, r) {
   df_att <- df %>% 
-    filter(rel_time == r) %>% 
-    group_by(cohort) %>% 
-    summarise(size = n(),
+    dplyr::filter(rel_time == r) %>% 
+    dplyr::group_by(cohort) %>% 
+    dplyr::summarise(size = n(),
               att = att,
               .groups = "keep") %>% 
-    slice(1) %>% 
-    ungroup() %>% 
-    mutate(pr = size/sum(size))
+    dplyr::slice(1) %>% 
+    dplyr::ungroup() %>% 
+    dplyr::mutate(pr = size/sum(size))
   
   df_att <- df_att %>% 
-    mutate(att = replace_na(att, 0)) %>% 
-    mutate(wt_att_contrib = att * pr)
+    dplyr::mutate(att = replace_na(att, 0)) %>% 
+    dplyr::mutate(wt_att_contrib = att * pr)
   
   att <- sum(df_att$wt_att_contrib)
 }
 
 # CS approach 
 # Function that calculates ATT(g, t)
-cs_gt_calc <- function(df, e, r) {
+cs_gt_calc <- function(df, e, r, covar_str = NULL) {
+  if (!is.null(covar_str)) {
+    df <- df %>% 
+      dplyr::mutate(across(everything(), ~ as.character(.x))) %>% 
+      dplyr::filter(eval(rlang::parse_expr(covar_str)))
+  }
   # Setup for r >= 0 
   if (r >= 0) {
     df_chrt <- df %>% 
-      filter(cohort == e) %>% 
-      filter(year == e + r | year == e - 1) %>% 
-      mutate(pre = if_else(year == e - 1, 1, 0))
+      dplyr::filter(cohort == e) %>% 
+      dplyr::filter(year == e + r | year == e - 1) %>% 
+      dplyr::mutate(pre = if_else(year == e - 1, 1, 0))
     
     tag_not_yet <- df %>% 
-      filter(year == e + r & d == 0) 
+      dplyr::filter(year == e + r & d == 0) 
     
     chrts_not_yet <- unique(tag_not_yet$cohort)
     
     df_not_yet <- df %>% 
-      filter(cohort %in% chrts_not_yet) %>% 
-      filter(year == e + r | year == e - 1) %>% 
-      mutate(pre = if_else(year == e - 1, 1, 0))
+      dplyr::filter(cohort %in% chrts_not_yet) %>% 
+      dplyr::filter(year == e + r | year == e - 1) %>% 
+      dplyr::mutate(pre = if_else(year == e - 1, 1, 0))
     
     if (nrow(df_not_yet) == 0) {
       return(NA_real_)
     } 
   } else {
     df_chrt <- df %>% 
-      filter(cohort == e) %>% 
-      filter(year == e + r | year == e + r - 1) %>% 
-      mutate(pre = if_else(year == e +r - 1, 1, 0))
+      dplyr::filter(cohort == e) %>% 
+      dplyr::filter(year == e + r | year == e + r - 1) %>% 
+      dplyr::mutate(pre = if_else(year == e +r - 1, 1, 0))
     
     tag_not_yet <- df %>% 
-      filter(year == e + r & d == 0) 
+      dplyr::filter(year == e + r & d == 0) 
     
     chrts_not_yet <- unique(tag_not_yet$cohort)
     
     df_not_yet <- df %>% 
-      filter(cohort %in% chrts_not_yet) %>% 
-      filter(year == e + r | year == e + r - 1) %>% 
-      mutate(pre = if_else(year == e + r - 1, 1, 0))
+      dplyr::filter(cohort %in% chrts_not_yet) %>% 
+      dplyr::filter(year == e + r | year == e + r - 1) %>% 
+      dplyr::mutate(pre = if_else(year == e + r - 1, 1, 0))
     
     if (nrow(df_not_yet) == 0) {
       return(NA_real_)
@@ -606,18 +749,72 @@ cs_gt_calc <- function(df, e, r) {
 }
 
 # Function that aggregates ATT(g, t) for a relative time 
-cs_did <- function(df, r) {
+cs_did <- function(df, r, covars = NULL) {
+  df <- na.omit(df)
   
+  if (!is.null(covars)) {
+    # needs a different grouping structure 
+    df_att <- df %>% 
+      dplyr::filter(rel_time == r) %>% 
+      dplyr::mutate(across(all_of(covars), ~ as.character(.x))) %>% 
+      dplyr::group_by(across(all_of(c("cohort", covars)))) %>% 
+      dplyr::summarise(size = n(), .groups = "keep") 
+    
+  } else {
   df_att <- df %>% 
-    filter(rel_time == r) %>% 
-    group_by(cohort) %>% 
-    summarise(size = n(), .groups = "keep") 
+    dplyr::filter(rel_time == r) %>% 
+    dplyr::group_by(cohort) %>% 
+    dplyr::summarise(size = n(), .groups = "keep") 
+  } 
   
   chts <- unique(df_att$cohort)
+  att_gt <- c()
   
+  if (!is.null(covars)) {
+    cells <- unique(df[covars])
+    df_loop <- df %>% 
+      dplyr::select(all_of(covars)) %>% 
+      dplyr::distinct(across(all_of(covars))) %>% 
+      dplyr::mutate(across(all_of(covars), 
+                           ~ paste0(dplyr::cur_column(), "==", 
+                                    paste0("\"", .x, "\""))))
+    
+    covar_strs <- df_loop %>% 
+      tidyr::unite(col = "var", sep = " & ") %>% 
+      dplyr::pull() 
+    
+    for (cht in chts) {
+      print(paste0("Cohort: ", cht))
+      for (str in covar_strs) {
+        att_gt <- append(att_gt, 
+                         cs_gt_calc(df, e = cht, r = r, covar_str = str))
+      }
+    }
+    
+    df_att_gt <- tibble(
+      cohort = rep(chts, each = length(covar_strs)),
+      att_gt = att_gt,
+      covar_str = rep(covar_strs, each = length(chts))
+    ) %>% 
+      tidyr::separate(covar_str, sep = "&", into = covars)
+    
+    #names(df_att_gt) <- c("cohort", "att_gt", covars)
+    df_att_gt %>% glimpse()
+    
+    # Left bind to the main df and calculate final estimate, dropping groups 
+    # with no control comparisons
+    df_att <- df_att %>% 
+      left_join(df_att_gt, by = c("cohort", covars)) %>% 
+      dplyr::ungroup() %>% 
+      dplyr::mutate(pr = size/sum(size)) %>% 
+      dplyr::mutate(att_contrib = pr * att_gt)
+    
+    att_e <- sum(df_att$att_contrib, na.rm = TRUE)
+    
+  } else {
   # Run the main CS estimator
   att_gt <- chts %>% 
-    map(~ cs_gt_calc(df, e = .x, r = r))
+    purrr::map(~ cs_gt_calc(df, e = .x, r = r))
   
   df_att_gt <- tibble(
     cohort = chts,
@@ -628,44 +825,51 @@ cs_did <- function(df, r) {
   # with no control comparisons
   df_att <- df_att %>% 
     left_join(df_att_gt, by = "cohort") %>% 
-    ungroup() %>% 
-    mutate(pr = size/sum(size)) %>% 
-    mutate(att_contrib = pr * att_gt)
+    dplyr::ungroup() %>% 
+    dplyr::mutate(pr = size/sum(size)) %>% 
+    dplyr::mutate(att_contrib = pr * att_gt)
   
   att_e <- sum(df_att$att_contrib, na.rm = TRUE)
+  }
 }
 
 # Imputation approach 
-impute_did <- function(df, r, rel_times_exclude = -1) {
+impute_did <- function(df, r, rel_times_exclude = -1, covars = NULL) {
   
   # Select untreated subsample and regress on cohort + time FEs
   df_d0 <- df %>% 
-    filter(d == 0)
+    dplyr::filter(d == 0)
   
   cohorts_include <- paste0("cohort_", unique(df_d0$cohort)[-1])
   years_include <- paste0("year_", unique(df_d0$year)[-1])
   
+  covars_include <- c(cohorts_include, years_include)
+  
+  if (!is.null(covars)) {
+    covars <- covars[!grepl("year_", covars) | 
+                       grepl(paste(years_include, collapse = "|"), covars)]
+    covars_include <- c(covars_include, covars)
+  }
+  
   mod_d0 <- ols_run(df = df_d0, y = "y", 
-                    covars = c(cohorts_include, years_include))
+                    covars = covars_include)
   
   estims_d0 <- mod_d0[["estimates"]]
   
-  mat_predict <- matrixPrep(df, cols = c(cohorts_include, years_include),
-                            constant = TRUE)
+  mat_predict <- matrixPrep(df, cols = covars_include, constant = TRUE)
   
   # Get fitted values and subtract them from each actual outcome to construct
   # Y dot
   y0_fit <- mat_predict %*% estims_d0
   df <- df %>% 
     cbind(y0_fit = y0_fit) %>% 
-    mutate(y_dot = y - y0_fit)
+    dplyr::mutate(y_dot = y - y0_fit)
   
   # Regress Y dot on the relative time indicators.
   rel_times <- grep("rel_time_", names(df), value = TRUE)
   
   rel_times_include <- rel_times[!(rel_times %in% paste0("rel_time_", 
                                                          rel_times_exclude))]
-  
   impute_mod <- ols_run(df, y = "y_dot", 
                         covars = rel_times_include)
   
