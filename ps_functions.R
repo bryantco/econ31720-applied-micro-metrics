@@ -2,7 +2,7 @@
 # AUXILIARY FUNCTIONS 
 ################################################################################
 matrixPrep <- function(df, cols, constant = FALSE) {
-  df_out <- df %>% select(all_of(cols))
+  df_out <- df %>% dplyr::select(all_of(cols))
   
   mat_out <- as.matrix(df_out)
   colnames(mat_out) <- NULL 
@@ -25,10 +25,16 @@ addConstant <- function(mat) {
 # Estimation ----
 # Least squares 
 ols_fit <- function(X, y) {
-  Xt <- t(X)
-  XtX <- Xt %*% X
-  Xty <- Xt %*% y
+  XtX <- crossprod(X, X)
+  Xty <- crossprod(X, y)
   b <- solve(XtX, Xty, tol = 1e-19)
+}
+
+# IV estimator 
+iv_fit <- function(Z, X, y) {
+  ZtX <- crossprod(Z, X)
+  Zty <- crossprod(Z, y)
+  b <- solve(ZtX, Zty, tol = 1e-19)
 }
 
 # Logit helpers ----
@@ -72,7 +78,6 @@ distance_calc <- function(x, z, V) {
 # Inference ---- 
 # Clustered SEs
 se_clust <- function(df, ols_fit, clust_var, fe_list = NULL) {
-  print(paste0("length of fe_list: ", length(fe_list)))
   # Grab useful values 
   df <- df[ols_fit$tag_obs, ] # grab obs. used in estimation
   clust_var_values <- unique(df[, clust_var])
@@ -516,6 +521,350 @@ impute_did_run <- function(df, r, rel_times_exclude = -1, covars = NULL) {
     n_obs = n,
     tag_obs = tag_obs
   )
+}
+
+# Synthetic control routines ----
+# Returns x1 as a K x 1 matrix and x0 as a K x N0 matrix 
+data_prep_sc <- function(df, treat_var, treat_unit, treat_time_var, 
+                         treat_time, covars, covars_lag = NULL,
+                         outcome_var) {
+  
+  # Complete the data 
+  df <- df %>% 
+    tidyr::complete(!!sym(treat_var), !!sym(treat_time_var))
+  
+  # Handle lags. If no lags are requested, take the mean of every covariate 
+  # across the pre-period. 
+  if (is.null(covars_lag)) {
+    # Grab covariates 
+    x1_mat <- df %>% 
+      dplyr::filter(!!sym(treat_var) == treat_unit) %>% 
+      dplyr::filter(!!sym(treat_time_var) < treat_time) %>% 
+      dplyr::summarise(across(all_of(covars), ~ mean(.x, na.rm = TRUE))) %>% 
+      as.matrix() %>% 
+      t()
+    
+    x0_mat <- df %>% 
+      dplyr::filter(!!sym(treat_var) != treat_unit) %>% 
+      dplyr::filter(!!sym(treat_time_var) < treat_time) %>% 
+      dplyr::group_by(!!sym(treat_var)) %>% 
+      dplyr::summarise(across(all_of(covars), ~ mean(.x, na.rm = TRUE))) 
+    
+    tag_obs_x0 <- which(rowSums(is.na(x0_mat))==0) # tag nonmissing obs.
+    tag_obs_x0_names <- x0_mat %>% 
+      na.omit() %>% 
+      dplyr::distinct(!!sym(treat_var)) %>% 
+      dplyr::pull() 
+    
+    x0_mat <- x0_mat %>% 
+      na.omit() %>% 
+      as.matrix() %>% 
+      t() 
+    
+    # Grab outcomes 
+    z1_mat <- df %>% 
+      dplyr::filter(!!sym(treat_var) == treat_unit) %>% 
+      dplyr::filter(!!sym(treat_time_var) < treat_time) %>% 
+      dplyr::select(!!sym(outcome_var)) %>% 
+      as.matrix() 
+    
+    z0_mat <- df %>% 
+      dplyr::filter(!!sym(treat_var) != treat_unit) %>% 
+      dplyr::filter(!!sym(treat_time_var) < treat_time) %>% 
+      dplyr::filter(!!sym(treat_var) %in% tag_obs_x0_names) %>% 
+      dplyr::select(!!sym(treat_var), !!sym(treat_time_var), 
+                    !!sym(outcome_var)) %>% 
+      tidyr::pivot_wider(names_from = !!sym(treat_time_var), 
+                         values_from = !!sym(outcome_var)) %>% 
+      dplyr::select(-!!sym(treat_var)) %>% 
+      as.matrix() %>% 
+      t() 
+    
+    return(list(x1 = x1_mat, x0 = x0_mat, x0_obs = tag_obs_x0, 
+                x0_units = tag_obs_x0_names,
+                z1_mat = z1_mat, z0_mat = z0_mat))
+    
+  } else {
+    x1 <- df %>% 
+      dplyr::filter(!!sym(treat_var) == treat_unit)
+    x0 <- df %>% 
+      dplyr::filter(!!sym(treat_var) != treat_unit)
+    
+    x0_n <- nrow(x0 %>% dplyr::distinct(!!sym(treat_var)))
+    
+    # Declare empty matrices 
+    x1_mat <- matrix(nrow = 1, ncol = 0)
+    x0_mat <- matrix(nrow = x0_n, ncol = 0)
+    
+    # Bind unit names 
+    x0_names <- x0 %>% dplyr::distinct(!!sym(treat_var)) %>% dplyr::pull() 
+    x0_mat <- x0_mat %>% cbind(x0_names)
+    
+    # First, handle variables not specified in the lag 
+    vars_pre <- covars[!covars %in% names(covars_lag)]
+    
+    if (length(vars_pre) > 0) {
+      x1_pre <- x1 %>% 
+        dplyr::filter(!!sym(treat_var) == treat_unit) %>% 
+        dplyr::summarise(across(all_of(vars_pre), ~ mean(.x, na.rm = TRUE))) %>% 
+        as.matrix()
+      
+      x0_pre <- x0 %>% 
+        dplyr::filter(!!sym(treat_var) != treat_unit) %>% 
+        dplyr::group_by(!!sym(treat_var)) %>% 
+        dplyr::summarise(across(all_of(vars_pre), ~ mean(.x, na.rm = TRUE))) %>% 
+        dplyr::select(-!!sym(treat_var)) %>% 
+        as.matrix()
+      
+      
+      x1_mat <- x1_mat %>% cbind(x1_pre)
+      x0_mat <- x0_mat %>% cbind(x0_pre)
+    }
+    
+    
+    for (var in names(covars_lag)) {
+      for (lag in covars_lag[[var]]) {
+        # Handle treated covariates 
+        var_lag <- df %>%
+          dplyr::select(!!sym(treat_time_var), !!sym(var), !!sym(treat_var)) %>% 
+          dplyr::filter(!!sym(treat_time_var) == treat_time - lag)
+        
+        x1_mat <- x1_mat %>% 
+          cbind(var_lag %>%
+                  dplyr::filter(!!sym(treat_var) == treat_unit) %>% 
+                  dplyr::pull(!!sym(var))
+          )
+        
+        x0_mat <- x0_mat %>% 
+          cbind(var_lag %>%
+                  dplyr::filter(!!sym(treat_var) != treat_unit) %>% 
+                  dplyr::pull(!!sym(var))
+          )
+      }
+    }
+    
+    names <- covars_lag %>% 
+      purrr::imap(~ paste0(.y, "_l_", .x)) %>% 
+      unlist() %>% 
+      unname()
+    
+    if (length(vars_pre) > 0) {
+      names <- c(vars_pre, names)
+    }
+    
+    tag_obs_x0 <- which(rowSums(is.na(x0_mat))==0) # tag nonmissing obs.
+    x0_mat_omit <- x0_mat %>% na.omit() 
+    tag_obs_x0_names <- unique(x0_mat_omit[, 1])
+    x0_mat <- matrix(as.numeric(x0_mat[, -1] %>% na.omit()), 
+                     ncol = ncol(x0_mat[, -1]))
+    
+    colnames(x0_mat) <- names
+    colnames(x1_mat) <- names 
+    
+    if (nrow(na.omit(x1_mat)) == 0) {
+      stop("Error! Treated unit is missing some values to match the pre-period")
+    }
+    
+    # Transpose to get the correct dimensions 
+    x1_mat <- x1_mat %>% t() 
+    x0_mat <- x0_mat %>% t()
+    
+    # Grab outcomes 
+    # z1: length of pre-period x 1
+    # z0: length of pre-period x 
+    z1_mat <- df %>% 
+      dplyr::filter(!!sym(treat_var) == treat_unit) %>% 
+      dplyr::filter(!!sym(treat_time_var) < treat_time) %>% 
+      dplyr::select(!!sym(outcome_var)) %>% 
+      as.matrix() 
+    
+    z0_mat <- df %>% 
+      dplyr::filter(!!sym(treat_var) != treat_unit) %>% 
+      dplyr::filter(!!sym(treat_time_var) < treat_time) %>% 
+      dplyr::filter(!!sym(treat_var) %in% tag_obs_x0_names) %>% 
+      dplyr::select(!!sym(treat_var), !!sym(treat_time_var), 
+                    !!sym(outcome_var)) %>% 
+      tidyr::pivot_wider(names_from = !!sym(treat_time_var), 
+                         values_from = !!sym(outcome_var)) %>% 
+      dplyr::select(-!!sym(treat_var)) %>% 
+      as.matrix() %>% 
+      t() 
+    
+    # x0: number of predictors x number of control donors
+    # x1: number of predictors x 1
+    out <- list(
+      x1 = x1_mat, 
+      x0 = x0_mat, 
+      x0_obs = tag_obs_x0,
+      x0_units = tag_obs_x0_names,
+      z0_mat = z0_mat,
+      z1_mat = z1_mat
+    )
+  }
+  
+}
+
+scRun <- function(mat_list, params, V_method = NULL) {
+  # Check correct weighting matrix methods 
+  v_allowed <- c("identity", "mahalanobis")
+  if (!is.null(V_method)) {
+    if (!V_method %in% v_allowed) {
+      stop("Error! You have specified a weighting option that is not allowed.") 
+    }
+  }
+  
+  x0 <- mat_list$x0
+  x1 <- mat_list$x1 
+  z0 <- mat_list$z0
+  z1 <- mat_list$z1
+  
+  # Normalize x0 and x1 
+  x0_n <- ncol(x0)
+  temp <- cbind(x0, x1)
+  # Divide by the standard deviation => everything has unit variance 
+  scaled <- t(scale(t(temp), center = FALSE, 
+                    scale = apply(temp, 1, sd, na.rm = TRUE)))
+  x0_norm <- scaled[, 1:x0_n] %>% as.matrix()
+  x1_norm <- scaled[, ncol(scaled)] %>% as.matrix()
+  
+  # Set up the weight matrix V which is square and has dimensions 
+  # no. of predictors x no. of predictors
+  if (is.null(V_method)) {
+    k <- nrow(x0_norm)
+    
+    # First, try a diagonal matrix with equal weights on the covariates 
+    v_diag <- rep(1/k, k)
+    vstar_diag <- optim(par = v_diag, fn = scLoss, x0_norm = x0_norm,
+                        x1_norm = x1_norm, z0 = z0, z1 = z1, 
+                        params = params, method = "BFGS")$par
+    
+    # Set up a regression of Z onto X
+    X <- cbind(x1_norm, x0_norm)
+    X <- cbind(rep(1, ncol(X)),t(X))
+    Z <- cbind(z1, z0)
+    beta <- try(solve(crossprod(X, X)) %*% t(X) %*% t(Z), silent=TRUE)
+    
+    if(inherits(beta,"try-error")) {
+      V <- vstar_diag
+    } else {
+      beta <- beta[-1, ] # drop the constants 
+      # Grab the diagonals of the outer product 
+      vstar_beta <- diag(beta %*% t(beta))
+      V <- vstar_beta/sum(vstar_beta) 
+    }
+  } else if (V_method == "identity") {
+    k <- nrow(x0_norm)
+    V <- rep(1/k, k)
+  } else if (V_method == "mahalanobis") {
+    X <- cbind(x1, x0)
+    V <- diag(v_calc(t(X)))
+  }
+  
+  
+  # Now, optimize over W
+  Vstar <- diag(x = as.numeric(abs(V)/sum(abs(V))),
+                nrow = length(V), ncol = length(V))
+  
+  
+  mod.w <- list() 
+  
+  mod.w$A <- matrix(rep(1, times = ncol(x0_norm)), nrow = 1) # weights sum to 1 
+  mod.w$Q <- 0.5 * t(x0_norm) %*% Vstar %*% x0_norm
+  mod.w$obj <- as.vector(-t(t(x0_norm) %*% Vstar %*% x1_norm))
+  mod.w$rhs <- c(1)
+  mod.w$sense <- c("=")
+  
+  # Return solution as a vector along with weights 
+  w <- round(gurobi::gurobi(mod.w, params = params)$x, 3)
+}
+
+scLoss <- function(v, x0_norm, x1_norm, z0, z1, params) {
+  # Normalize V
+  V <- diag(x = as.numeric(abs(v)/sum(abs(v))),
+            nrow = length(v), ncol = length(v))
+  
+  # Find the optimal W by solving a quadratic program
+  mod.w <- list()
+  
+  mod.w$A <- matrix(rep(1, times = ncol(x0_norm)), nrow = 1) # weights sum to 1
+  mod.w$Q <- 0.5 * t(x0_norm) %*% V %*% x0_norm
+  mod.w$obj <- as.vector(-t(t(x0_norm) %*% V %*% x1_norm))
+  mod.w$rhs <- c(1)
+  mod.w$sense <- c("=")
+  
+  w <- round(gurobi::gurobi(mod.w, params = params)$x, 3)
+  
+  
+  # Calculate MSE of the SC estimator 
+  # z1 is pre-period x 1, z0 is pre-period x N0, W is N0 x 1
+  loss <- crossprod(z1 - z0 %*% w, 
+                    z1 - z0 %*% w) %>% as.numeric()
+  loss <- loss/nrow(z0)
+  return(loss)
+}
+
+sc_att_calc <- function(df, treat_var, treat_unit, outcome_var, W,
+                        treat_time_var, dataprep_df, treat_time) {
+  
+  # Grab outcomes for treated unit 
+  # Not including year and treatment identifier, this will be a T x 1 dataframe 
+  # where T = number of periods in the data 
+  z1_full <- df %>% 
+    dplyr::filter(!!sym(treat_var) == treat_unit) %>% 
+    dplyr::select(!!sym(treat_time_var), !!sym(outcome_var), !!sym(treat_var))
+  
+  z1_names <- z1_full %>% dplyr::select(!!sym(treat_var)) %>% dplyr::pull() 
+  z1_times <- z1_full %>% 
+    dplyr::select(!!sym(treat_time_var)) %>% 
+    dplyr::pull() 
+  
+  z1_full <- z1_full %>% 
+    dplyr::select(-!!sym(treat_time_var), -!!sym(treat_var))
+  
+  # Grab outcomes for control units 
+  z0_full <- df %>% 
+    dplyr::filter(!!sym(treat_var) %in% dataprep_df$x0_units) %>% 
+    dplyr::select(!!sym(treat_time_var), !!sym(outcome_var), !!sym(treat_var))
+  
+  z0_full <- z0_full %>% 
+    tidyr::pivot_wider(names_from = !!sym(treat_time_var), 
+                       values_from = !!sym(outcome_var)) %>% 
+    dplyr::select(-!!sym(treat_var))
+  
+  # Convert to matrix and calculate ATTs 
+  z1_full <- as.matrix(z1_full)
+  z0_full <- as.matrix(z0_full) %>% t()
+  W <- as.matrix(W, nrow = length(w))
+  
+  att_mat <- z1_full - z0_full %*% W
+  
+  att_df <- cbind(z1_names, z1_times, as.data.frame(att_mat))
+  
+  colnames(att_df) <- c(treat_var, treat_time_var, "att")
+  
+  att_df <- att_df %>% 
+    dplyr::mutate(event_time = !!sym(treat_time_var) - treat_time)
+  
+  return(att_df)
+}
+
+scRoutine <- function(df, treat_var, treat_unit, treat_time_var, treat_time,
+                      covars, outcome_var, covars_lag, params,
+                      outcome_var_att, V_method = NULL) {
+  
+  df_in <- data_prep_sc(df, treat_var = treat_var, treat_unit = treat_unit, 
+                        treat_time_var = treat_time_var, 
+                        treat_time = treat_time,
+                        covars = covars, outcome_var = outcome_var, 
+                        covars_lag = covars_lag)
+  
+  w <- scRun(df_in, params = params, V_method = V_method)
+  names <- df_in$x0_units
+  att <- sc_att_calc(df, treat_var, treat_unit, outcome_var = outcome_var_att,
+                     W = w, treat_time_var, dataprep_df = df_in,
+                     treat_time = treat_time)
+  
+  return(list(w = w, names = names, att = att))
 }
 
 ################################################################################
