@@ -1086,7 +1086,7 @@ scRoutine <- function(df, treat_var, treat_unit, treat_time_var, treat_time,
 
 # Marginal Treatment Effect routines ----
 # Function to calculate the MTE with binary treatment 
-mte_calc <- function(df, y_var, treat_var) {
+mte_calc <- function(df, y_var, treat_var, u_grid) {
   # Grab the data with D = 1 and D = 0
   df_treat <- df %>% 
     filter(!!sym(treat_var) == 1)
@@ -1155,7 +1155,7 @@ mte_bootstrap <- function(mte_results, u_grid, reps = 100) {
     
     # Calculate the MTE over the vector of U's
     mte_boot <- mte_calc(df = df_boot, y_var = y_var, 
-                         treat_var = treat_var)$mte_vec
+                         treat_var = treat_var, u_grid = u_grid)$mte_vec
     
     mte_bstrap_mat <- mte_bstrap_mat %>% cbind(mte_boot)
   }
@@ -1233,7 +1233,7 @@ target_param_bstrap <- function(mte_results, reps, target, u_grid) {
     
     # Calculate the MTE over the vector of U's
     mte_boot <- mte_calc(df = df_boot, y_var = y_var, 
-                         treat_var = treat_var)$mte_vec
+                         treat_var = treat_var, u_grid = u_grid)$mte_vec
     
     # Gather results
     mte_df <- tibble(
