@@ -37,6 +37,13 @@ iv_fit <- function(Z, X, y) {
   b <- solve(ZtX, Zty, tol = 1e-19)
 }
 
+# TSLS
+tsls_fit <- function(ZtX, Zty, ZtZ) {
+  denom <- t(ZtX) %*% solve(ZtZ) %*% ZtX
+  num <- t(ZtX) %*% solve(ZtZ) %*% Zty
+  b <- solve(denom, num, tol = 1e-19)
+}
+
 # Logit helpers ----
 # Sigmoid function
 sigmoid <- function(z) {
@@ -76,28 +83,65 @@ distance_calc <- function(x, z, V) {
 
 
 # Inference ---- 
+# F-test of all the slope coefficients from OLS 
+test_f_all <- function(ols_fit, df, ols_vcov) {
+  J <- ols_fit$k - 1
+  zeros <- matrix(rep(0, J), nrow = J)
+  R <- cbind(zeros, diag(J))
+  b2 <- as.matrix(ols_fit$estimates[-1], nrow = J)
+  
+  # Get the F-stat
+  f <- (t(b2) %*% solve(R %*% ols_vcov %*% t(R), tol = 1e-30) %*% b2)/J
+  f <- as.numeric(f)
+  
+  # Conduct the F-test 
+  # The statistic JF is asymptotic chi-squared with J degrees of freedom 
+  p <- pchisq(f, df = J, lower.tail = FALSE)
+  
+  # Return output 
+  f_out <- list(
+    f = f,
+    p = p
+  )
+}
+
+# Normal OLS SEs 
+se_ols <- function(ols_fit) {
+  s2 <- ols_fit$ssr/(ols_fit$n_obs - ols_fit$k)
+  X <- ols_fit$design_mat
+  
+  vcov <- s2 * solve(crossprod(X, X))
+  se <- sqrt(diag(vcov))
+  
+  return(se)
+}
+
 # Clustered SEs
-se_clust <- function(df, ols_fit, clust_var, fe_list = NULL) {
+se_clust <- function(df, lin_fit, clust_var, fe_list = NULL,
+                     vcov_return = FALSE, ssc = TRUE) {
+  
   # Grab useful values 
-  df <- df[ols_fit$tag_obs, ] # grab obs. used in estimation
+  df <- df[lin_fit$tag_obs, ] # grab obs. used in estimation
   clust_var_values <- unique(df[, clust_var])
   m <- length(clust_var_values) # number of clusters 
-  n <- ols_fit$n_obs
-  k <- ols_fit$k
+  n <- lin_fit$n_obs
+  k <- lin_fit$k
   meat <- matrix(0, nrow = k, ncol = k)
   j <- 1
   
   for (i in clust_var_values) {
     indices <- which(df[, clust_var] == i)
-    Xi <- matrix(ols_fit[["design_mat"]][indices, ], nrow = length(indices))
-    eta_i <- as.matrix(ols_fit$residuals[indices], ncol = 1)
+    Xi <- matrix(lin_fit[["design_mat"]][indices, ], nrow = length(indices))
+      
+    eta_i <- as.matrix(lin_fit$residuals[indices], ncol = 1)
     XiTXi <- t(Xi) %*% eta_i %*% t(eta_i) %*% Xi
-    
+      
     meat <- meat + XiTXi
     j <- j + 1
   }
-
-  X <- ols_fit$design_mat 
+  
+  
+  X <- lin_fit$design_mat 
   bread <- solve(t(X) %*% X)
 
   # Final result: only output the SE, making Stata finite sample correction
@@ -105,11 +149,22 @@ se_clust <- function(df, ols_fit, clust_var, fe_list = NULL) {
   # prevent them from being subtracted off. 
   k_eff <- k
   if (!is.null(fe_list)) {
-    k_eff <- k - length(fe_list) - ols_fit$constant - 1
+    k_eff <- k - length(fe_list) - lin_fit$constant - 1
   }
   
-  vcov <- (m/(m-1)) * ((n-1)/(n-k_eff)) * (bread %*% meat %*% bread)
-  se_out <- sqrt(diag(vcov))
+  if (ssc) {
+    vcov <- (m/(m-1)) * ((n-1)/(n-k_eff)) * (bread %*% meat %*% bread)
+  } else {
+    vcov <- bread %*% meat %*% bread
+  }
+  
+  # If user requested full variance-covariance matrix, return it. Else,
+  # only return the standard errors
+  if (vcov_return) {
+    return(vcov)
+  } else {
+    return(sqrt(diag(vcov)))
+  }
 }
 
 # Bootstrap ----
@@ -209,11 +264,102 @@ se_boot_block <- function(fun_results, seed = 12345, B = 50, block) {
   se_bstrap <- sqrt(diag(var(estims_bstrap, na.rm = TRUE)))
 }
 
+# Anderson-Rubin ----
+# Two-tailed t-test
+test_t <- function(ols_fit, var_name, b0 = 0, se_vec) {
+  if(!var_name %in% ols_fit$var_names) {
+    stop("Error! Variable not found in the regression.")
+  }
+  
+  if (var_name == "constant") {
+    pos <- 1
+  } else {
+    pos <- ols_fit$constant + which(ols_fit$var_names == var_name)
+  }
+  
+  # Grab the correct standard error and estimate 
+  se <- se_vec[pos]
+  b <- ols_fit$estimates[pos]
+  
+  # Construct the t-statistic 
+  t <- (b - b0)/se 
+  df <- ols_fit$n_obs - ols_fit$k
+  p_val <- 2 * stats::pt(abs(t), lower.tail = FALSE, df = df)
+  
+  t_out <- list(
+    t = t,
+    p_val = p_val
+  )
+}
+
+beta_grid <- seq(-5, 5, by = .01)
+
+test_ar <- function(tsls_fit, df, d_var, z_var,
+                    beta_grid, se_meth, se_opts, alpha) {
+  # Set up the confidence set 
+  conf_set <- c()
+  p_vals <- c()
+  
+  # Grab needed quantities 
+  y <- tsls_fit$y
+  X <- tsls_fit$X_mat
+  D <- df[tsls_fit$tag_obs, ] %>% 
+    select(!!sym(d_var)) %>% 
+    as.matrix(ncol = 1) 
+  
+  # Loop over the grid of betas 
+  for (b in beta_grid) {
+    print(paste0("Testing the beta value ... ", b))
+    # Grab the residuals 
+    residuals_null <- y - D*b
+    
+    # Fit the AR regression: regress the residuals onto the first stage
+    df_temp <- df[tsls_fit$tag_obs, ] %>% 
+      cbind(residuals_null) %>% 
+      as.data.frame()
+    
+    reg_ar <- ols_run(df_temp, y = "residuals_null", 
+                      covars = tsls_fit$var_names_fs)
+    
+    if (se_meth == "clust") {
+      se_args <- list(
+        df = df_temp,
+        lin_fit = reg_ar
+      )
+      
+      se_args <- c(se_args, se_opts)
+      reg_ar_se <- do.call("se_clust", args = se_args)
+    }
+    
+    # Compute the t-test on the scalar instrument for the scalar endogeneous
+    # variable 
+    # If we fail to reject the null hypothesis that beta = the current value,
+    # then add the current value to the AR confidence set.
+    t <- test_t(reg_ar, var_name = z_var, se_vec = reg_ar_se)
+    p_vals <- c(p_vals, t$p_val)
+    
+    if (t$p_val <= alpha) {
+      conf_set <- c(conf_set, "out")
+    } else {
+      conf_set <- c(conf_set, "in")
+    }
+  }
+  
+  results <- tibble(
+    beta = beta_grid,
+    conf_set = conf_set,
+    p_vals = p_vals
+  )
+}
+
+
 ################################################################################
 # ROUTINES 
 ################################################################################
 # Function arguments are consistently coded to play nice with other functions 
 # eg bootstrapping 
+# If doing a constant-only regression, specify y and covars to be the same
+# outcome variable string, and set constant = FALSE.
 ols_run <- function(df, y, covars, constant = TRUE, wt = NULL) {
   
   # Select nonempty rows and prep 
@@ -233,7 +379,16 @@ ols_run <- function(df, y, covars, constant = TRUE, wt = NULL) {
   df <- df[, c(covars, y)]
   n <- nrow(df)
   k <- length(covars) + constant
-  X_unweight <- matrixPrep(df, covars, constant = constant)
+  
+  # Prep X
+  # Handle the case where a regression only includes an intercept 
+  if (length(unique(c(y, covars))) > 1) {
+    X_unweight <- matrixPrep(df, covars, constant = constant) 
+  } else {
+    # only matrix of ones if user requested a constant-only regression 
+    X_unweight <- matrix(rep(1, n), nrow = n)
+    
+  }
   y_unweight <- matrixPrep(df, y) 
   
   X <- X_unweight
@@ -256,6 +411,9 @@ ols_run <- function(df, y, covars, constant = TRUE, wt = NULL) {
   residuals <- y - fitted_values
   residuals_unweight <- y_unweight - fitted_values_unweight
   
+  # Sum of square residuals 
+  ssr <- sum(residuals^2)
+  
   # R-squared and adjusted R-squared
   sst <- sum((y - mean(y))^2)
   ssr <- sum(residuals^2)
@@ -277,8 +435,67 @@ ols_run <- function(df, y, covars, constant = TRUE, wt = NULL) {
     fitted_values = fitted_values,
     residuals = residuals,
     residuals_unweight = residuals_unweight,
+    ssr = ssr,
     r_sq = r_sq,
     r_sq_adjust = r_sq_adjust
+  )
+}
+
+# TSLS
+tsls_run <- function(df, y, x_vars, z_list, constant = TRUE) {
+  # Select nonempty rows and prep 
+  vars_endo <- intersect(x_vars, names(z_list)) # endogeneous variables
+  instruments <- z_list %>% unlist() %>% unname() # instruments 
+  z_vars <- c(x_vars[!x_vars %in% vars_endo], instruments)
+  all_vars <- union(x_vars, instruments)
+  
+  # Grab names 
+  vars_non_endo_names <- setdiff(x_vars, vars_endo)
+  var_names_fs <- c(vars_non_endo_names, instruments)
+  
+  # Select nonempty rows and prep 
+  df <- df[, c(all_vars, y)]
+  
+  tag_obs <- which(rowSums(is.na(df))==0) # tag nonmissing obs.
+  df <- na.omit(df)
+  n <- nrow(df)
+  k <- length(x_vars) + constant
+  
+  # Prep X, Z, and y
+  X <- matrixPrep(df, x_vars, constant = constant) 
+  Z <- matrixPrep(df, z_vars, constant = constant)
+  y <- matrixPrep(df, y) 
+  
+  # Calculate the ingredients of the TSLS fit 
+  ZtX <- crossprod(Z, X)
+  Zty <- crossprod(Z, y)
+  ZtZ <- crossprod(Z, Z)
+  
+  # Save the design matrix for later: PzX = Z(Z'Z)^{-1}Z'X
+  design_mat <- Z %*% solve(ZtZ) %*% ZtX
+  
+  # Fit the model 
+  b <- tsls_fit(ZtX, Zty, ZtZ)
+  coefs <- c(t(b[, 1])) # Convert matrix coefs to vector
+  
+  # Get the residuals as y - Xb, NOT y - Xhat %*% b
+  residuals <- y - X %*% b
+  
+  # Final output
+  tsls_out <- list(
+    design_mat = design_mat,
+    y = y,
+    Z_mat = Z,
+    X_mat = X,
+    call = match.call(),
+    estimates = coefs,
+    constant = constant,
+    n_obs = n,
+    k = k,
+    tag_obs = tag_obs,
+    var_names = x_vars,
+    var_names_fs = var_names_fs,
+    residuals = residuals
   )
 }
 
@@ -380,7 +597,7 @@ find_treated_nn <- function(df, y, k, covars, treat_var,
   if (estimand == "att") {
     estim <- mean(y1 - y0_use)
   } else if (estimand == "atu") {
-    estim <- mean(y0 - y1_use)
+    estim <- mean(y1_use - y0)
   } else if (estimand == "ate") {
     y1_use <- c(y1, y1_use)
     y0_use <- c(y0, y0_use)
@@ -865,6 +1082,192 @@ scRoutine <- function(df, treat_var, treat_unit, treat_time_var, treat_time,
                      treat_time = treat_time)
   
   return(list(w = w, names = names, att = att))
+}
+
+# Marginal Treatment Effect routines ----
+# Function to calculate the MTE with binary treatment 
+mte_calc <- function(df, y_var, treat_var) {
+  # Grab the data with D = 1 and D = 0
+  df_treat <- df %>% 
+    filter(!!sym(treat_var) == 1)
+  
+  df_untreat <- df %>% 
+    filter(!!sym(treat_var) == 0)
+  
+  # Separate regressions 
+  reg_d1 <- ols_run(df_treat, y = y_var, covars = "phat")
+  reg_d0 <- ols_run(df_untreat, y = y_var, covars = "phat")
+  
+  # Calculate the MTE 
+  b0 <- reg_d0$estimates[2]*2
+  a0 <- reg_d0$estimates[1] - b0/2
+  a1 <- reg_d1$estimates[1]
+  b1 <- reg_d1$estimates[2]*2
+  
+  mte_vec <- (a1 - a0) + (b1 - b0) * u_grid  
+  
+  mte_out <- list(
+    mte_vec = mte_vec,
+    y_var = y_var,
+    treat_var = treat_var,
+    call = match.call()
+  )
+}
+
+mte_bootstrap <- function(mte_results, u_grid, reps = 100) {
+  # Setup for bootstrap: declare matrix with rows equal to the size of the 
+  # U grid. Each column will contain the results from one iteration.
+  mte_bstrap_mat <- matrix(nrow = length(u_grid), ncol = 1,
+                           data = u_grid)  
+  
+  # Grab the data used in estimation 
+  # This assumes a df has all complete observations for now 
+  call <- mte_results[["call"]]
+  df <- rlang::eval_tidy(call[["df"]])
+  treat_var <- mte_results[["treat_var"]]
+  y_var <- mte_results[["y_var"]]
+  
+  # Handles proportions in creating the bootstrap sample 
+  levels <- df %>% 
+    dplyr::select(!!sym(treat_var)) %>% 
+    dplyr::distinct() %>% 
+    dplyr::pull() 
+  
+  var_values <- df %>% 
+    dplyr::select(!!sym(treat_var)) %>% 
+    dplyr::pull() 
+  
+  obs_labels <- match(var_values, levels)
+  probs <- levels %>% 
+    purrr::map_dbl(~ sum(var_values == .x))
+  
+  probs <- probs/length(var_values)
+  
+  obs_probs <- obs_labels %>% 
+    purrr::map_dbl(~ probs[.x])
+  
+  idx <- 1:nrow(df) # indices 
+  
+  for (i in 1:reps) {
+    # Create bootstrap treated and untreated observations 
+    idx_sample <- sample(idx, size = nrow(df), replace = TRUE, prob = obs_probs)
+    df_boot <- df[idx_sample, ]
+    
+    # Calculate the MTE over the vector of U's
+    mte_boot <- mte_calc(df = df_boot, y_var = y_var, 
+                         treat_var = treat_var)$mte_vec
+    
+    mte_bstrap_mat <- mte_bstrap_mat %>% cbind(mte_boot)
+  }
+  
+  # Compute the bootstrap standard deviation if requested.
+  mte_bstrap_se <- mte_bstrap_mat[, -1] %>% 
+    apply(., 1, sd)
+  
+  return(mte_bstrap_se)
+}
+
+# Function to calculate the ATT weights 
+att_mte_wt <- function(df, treat_var, u_vec) {
+  pr_treat <- nrow(df %>% filter(!!sym(treat_var) == 1))/nrow(df)
+  
+  p_vec <- eval(rlang::parse_expr(paste0("df$", "phat")))
+  
+  num <- u_vec %>% 
+    purrr::map_dbl(~ sum(p_vec >= .x)/length(p_vec))
+  
+  wt <- num/pr_treat
+}
+
+# Function to calculate the ATU weights 
+atu_mte_wt <- function(df, treat_var, u_vec) {
+  pr_untreat <- nrow(df %>% filter(!!sym(treat_var) == 0))/nrow(df)
+  
+  p_vec <- eval(rlang::parse_expr(paste0("df$", "phat")))
+  
+  num <- u_vec %>% 
+    purrr::map_dbl(~ sum(p_vec < .x)/length(p_vec))
+  
+  wt <- num/pr_untreat
+}
+
+# Function to bootstrap target parameters from MTE 
+target_param_bstrap <- function(mte_results, reps, target, u_grid) {
+  
+  # Setup for bootstrap: declare matrix with columns equal to the number of 
+  # iterations 
+  target_bstrap_mat <- matrix(nrow = 1, ncol = reps)
+  
+  # Grab the data used in estimation 
+  # This assumes a df has all complete observations for now 
+  call <- mte_results[["call"]]
+  df <- rlang::eval_tidy(call[["df"]])
+  treat_var <- mte_results[["treat_var"]]
+  y_var <- mte_results[["y_var"]]
+  
+  # Handles proportions in creating the bootstrap sample 
+  levels <- df %>% 
+    dplyr::select(!!sym(treat_var)) %>% 
+    dplyr::distinct() %>% 
+    dplyr::pull() 
+  
+  var_values <- df %>% 
+    dplyr::select(!!sym(treat_var)) %>% 
+    dplyr::pull() 
+  
+  obs_labels <- match(var_values, levels)
+  probs <- levels %>% 
+    purrr::map_dbl(~ sum(var_values == .x))
+  
+  probs <- probs/length(var_values)
+  
+  obs_probs <- obs_labels %>% 
+    purrr::map_dbl(~ probs[.x])
+  
+  idx <- 1:nrow(df) # indices 
+  
+  for (i in 1:reps) {
+    # Create bootstrap treated and untreated observations 
+    idx_sample <- sample(idx, size = nrow(df), replace = TRUE, prob = obs_probs)
+    df_boot <- df[idx_sample, ]
+    
+    # Calculate the MTE over the vector of U's
+    mte_boot <- mte_calc(df = df_boot, y_var = y_var, 
+                         treat_var = treat_var)$mte_vec
+    
+    # Gather results
+    mte_df <- tibble(
+      u = u_grid,
+      mte = mte_boot 
+    )
+    
+    # Compute the target parameter 
+    # ATT 
+    if (target == "att") {
+      mte_df <- mte_df %>% 
+        mutate(att_wt = att_mte_wt(df_boot, treat_var = "jikokoa", u = u)) 
+      
+      att <- sum(mte_df$mte * mte_df$att_wt)/length(mte_df$u)
+      
+      target_bstrap_mat[, i] <- att
+      
+    } else if (target == "atu") {
+      mte_df <- mte_df %>% 
+        mutate(atu_wt = atu_mte_wt(df_boot, treat_var = "jikokoa", u = u))
+      
+      atu <- sum(mte_df$mte * mte_df$atu_wt)/length(mte_df$u)
+      
+      target_bstrap_mat[, i] <- atu
+    } else if (target == "ate") {
+      ate <- sum(mte_df$mte)/length(mte_df$u)
+      
+      target_bstrap_mat[, i] <- ate
+    }
+  }
+  
+  se <- sd(as.vector(target_bstrap_mat))
+  
+  return(se)
 }
 
 ################################################################################
